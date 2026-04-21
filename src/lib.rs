@@ -1,15 +1,38 @@
-use nih_plug::prelude::*;
-use std::sync::{Arc, Mutex};
+// cargo xtask bundle rust_nam --release
 
-// This is a shortened version of the gain example with most comments removed, check out
-// https://github.com/robbert-vdh/nih-plug/blob/master/plugins/examples/gain/src/lib.rs to get
-// started
+const INPUT_GAIN_MIN: f32 = -30.0;
+const INPUT_GAIN_MAX: f32 = 30.0;
+const INPUT_GAIN_DEF: f32 = 0.0;
+
+const GATE_ENABLED_DEF: bool = true;
+
+const GATE_THRESHOLD_MIN: f32 = -80.0;
+const GATE_THRESHOLD_MAX: f32 = 0.0;
+const GATE_THRESHOLD_DEF: f32 = -60.0;
+
+const GATE_RELEASE_MIN: f32 = 10.0;
+const GATE_RELEASE_MAX: f32 = 500.0;
+const GATE_RELEASE_DEF: f32 = 100.0;
+
+const GATE_ATTACK_MIN: f32 = 0.1;
+const GATE_ATTACK_MAX: f32 = 50.0;
+const GATE_ATTACK_DEFAULT: f32 = 5.0;
+
+const OUTPUT_GAIN_MIN: f32 = -30.0;
+const OUTPUT_GAIN_MAX: f32 = 30.0;
+const OUTPUT_GAIN_DEF: f32 = 0.0;
+
+use nih_plug::prelude::*;
+use std::sync::{Arc};
 
 struct RustNam {
     params: Arc<RustNamParams>,
+    rms_state: f32, // running RMS estimate
+    gain_reduction: f32, // current gate gain, 0.0 = closed, 1.0 = open
+    sample_rate: f32, // needed to convert ms to per-sample coefficients
 }
 
-/// The [`Params`] derive macro gathers all of the information needed for the wrapper to know about
+/// The [`Params`] derive macro gathers all the information needed for the wrapper to know about
 /// the plugin's parameters, persistent serializable fields, and nested parameter groups. You can
 /// also easily implement [`Params`] by hand if you want to, for instance, have multiple instances
 /// of a parameters struct for multiple identical oscillators/filters/envelopes.
@@ -19,44 +42,32 @@ struct RustNamParams {
     /// these IDs remain constant, you can rename and reorder these fields as you wish. The
     /// parameters are exposed to the host in the same order they were defined. In this case, this
     /// gain parameter is stored as linear gain while the values are displayed in decibels.
-    #[id = "gain"]
-    pub gain: FloatParam,
+    #[id = "input_gain"]
+    pub input_gain: FloatParam,
 
-    /// This field isn't used in this example, but anything written to the vector would be restored
-    /// together with a preset/state file saved for this plugin. This can be useful for storing
-    /// things like sample data.
-    #[persist = "industry_secrets"]
-    pub random_data: Mutex<Vec<f32>>,
+    #[id = "gate_enabled"]
+    pub gate_enabled: BoolParam,
 
-    /// You can also nest parameter structs. These will appear as a separate nested group if your
-    /// DAW displays parameters in a tree structure.
-    #[nested(group = "Subparameters")]
-    pub sub_params: SubParams,
+    #[id = "gate_threshold"]
+    pub gate_threshold: FloatParam,
 
-    /// Nested parameters also support some advanced functionality for reusing the same parameter
-    /// struct multiple times.
-    #[nested(array, group = "Array Parameters")]
-    pub array_params: [ArrayParams; 3],
-}
+    #[id = "gate_release"]
+    pub gate_release: FloatParam,
 
-#[derive(Params)]
-struct SubParams {
-    #[id = "thing"]
-    pub nested_parameter: FloatParam,
-}
+    #[id = "gate_attack"]
+    pub gate_attack: FloatParam,
 
-#[derive(Params)]
-struct ArrayParams {
-    /// This parameter's ID will get a `_1`, `_2`, and a `_3` suffix because of how it's used in
-    /// `array_params` above.
-    #[id = "nope"]
-    pub nope: FloatParam,
+    #[id = "output_gain"]
+    pub output_gain: FloatParam,
 }
 
 impl Default for RustNam {
     fn default() -> Self {
         Self {
             params: Arc::new(RustNamParams::default()),
+            rms_state: 0.0,
+            gain_reduction: 0.0,
+            sample_rate: 44100.0, // overwritten in initialize()
         }
     }
 }
@@ -64,18 +75,19 @@ impl Default for RustNam {
 impl Default for RustNamParams {
     fn default() -> Self {
         Self {
+            // *** INPUT GAIN ***
             // This gain is stored as linear gain. NIH-plug comes with useful conversion functions
             // to treat these kinds of parameters as if we were dealing with decibels. Storing this
             // as decibels is easier to work with, but requires a conversion for every sample.
-            gain: FloatParam::new(
-                "Gain",
-                util::db_to_gain(0.0),
+            input_gain: FloatParam::new(
+                "Input Gain",
+                util::db_to_gain(INPUT_GAIN_DEF),
                 FloatRange::Skewed {
-                    min: util::db_to_gain(-30.0),
-                    max: util::db_to_gain(30.0),
+                    min: util::db_to_gain(INPUT_GAIN_MIN),
+                    max: util::db_to_gain(INPUT_GAIN_MAX),
                     // This makes the range appear as if it was linear when displaying the values as
                     // decibels
-                    factor: FloatRange::gain_skew_factor(-30.0, 30.0),
+                    factor: FloatRange::gain_skew_factor(INPUT_GAIN_MIN, INPUT_GAIN_MAX),
                 },
             )
             // Because the gain parameter is stored as linear gain instead of storing the value as
@@ -85,30 +97,77 @@ impl Default for RustNamParams {
             // There are many predefined formatters we can use here. If the gain was stored as
             // decibels instead of as a linear gain value, we could have also used the
             // `.with_step_size(0.1)` function to get internal rounding.
-            .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
+            .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
             .with_string_to_value(formatters::s2v_f32_gain_to_db()),
-            // Persisted fields can be initialized like any other fields, and they'll keep their
-            // values when restoring the plugin's state.
-            random_data: Mutex::new(Vec::new()),
-            sub_params: SubParams {
-                nested_parameter: FloatParam::new(
-                    "Unused Nested Parameter",
-                    0.5,
-                    FloatRange::Skewed {
-                        min: 2.0,
-                        max: 2.4,
-                        factor: FloatRange::skew_factor(2.0),
-                    },
-                )
-                    .with_value_to_string(formatters::v2s_f32_rounded(2)),
-            },
-            array_params: [1, 2, 3].map(|index| ArrayParams {
-                nope: FloatParam::new(
-                    format!("Nope {index}"),
-                    0.5,
-                    FloatRange::Linear { min: 1.0, max: 2.0 },
-                ),
-            }),
+
+            // *** ENABLE GATE ***
+
+            gate_enabled: BoolParam::new(
+                "Enable Gate",
+                GATE_ENABLED_DEF
+            ),
+
+            // *** GATE THRESHOLD ***
+
+            gate_threshold: FloatParam::new(
+                "Gate Threshold",
+                util::db_to_gain(GATE_THRESHOLD_DEF),
+                FloatRange::Skewed {
+                    min: util::db_to_gain(GATE_THRESHOLD_MIN),
+                    max: util::db_to_gain(GATE_THRESHOLD_MAX),
+                    factor: FloatRange::gain_skew_factor(GATE_THRESHOLD_MIN, GATE_THRESHOLD_MAX),
+                },
+            )
+                .with_smoother(SmoothingStyle::Logarithmic(50.0))
+                .with_unit(" dB")
+                .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
+                .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+
+            // *** GATE RELEASE ***
+
+            gate_release: FloatParam::new(
+                "Gate Release",
+                GATE_RELEASE_DEF,
+                FloatRange::Skewed {
+                    min: GATE_RELEASE_MIN,
+                    max: GATE_RELEASE_MAX,
+                    factor : FloatRange::skew_factor(0.5)
+                },
+            )
+                .with_unit(" ms")
+                .with_value_to_string(formatters::v2s_f32_rounded(1))
+                .with_string_to_value(Arc::new(|s| s.parse().ok())),
+
+            // *** GATE ATTACK ***
+
+            gate_attack: FloatParam::new(
+                "Gate Attack",
+                GATE_ATTACK_DEFAULT,
+                FloatRange::Skewed {
+                    min: GATE_ATTACK_MIN,
+                    max: GATE_ATTACK_MAX,
+                    factor : FloatRange::skew_factor(0.5)
+                },
+            )
+                .with_unit(" ms")
+                .with_value_to_string(formatters::v2s_f32_rounded(1))
+                .with_string_to_value(Arc::new(|s| s.parse().ok())),
+
+            // *** OUTPUT GAIN ***
+
+            output_gain: FloatParam::new(
+                "Output Gain",
+                util::db_to_gain(OUTPUT_GAIN_DEF),
+                FloatRange::Skewed {
+                    min: util::db_to_gain(OUTPUT_GAIN_MIN),
+                    max: util::db_to_gain(OUTPUT_GAIN_MAX),
+                    factor: FloatRange::gain_skew_factor(OUTPUT_GAIN_MIN, OUTPUT_GAIN_MAX),
+                },
+            )
+                .with_smoother(SmoothingStyle::Logarithmic(50.0))
+                .with_unit(" dB")
+                .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
+                .with_string_to_value(formatters::s2v_f32_gain_to_db()),
         }
     }
 }
@@ -126,18 +185,17 @@ impl Plugin for RustNam {
     // The first audio IO layout is used as the default. The other layouts may be selected either
     // explicitly or automatically by the host or the user depending on the plugin API/backend.
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(2),
-        main_output_channels: NonZeroU32::new(2),
+        main_input_channels: NonZeroU32::new(1),
+        main_output_channels: NonZeroU32::new(1),
 
         aux_input_ports: &[],
         aux_output_ports: &[],
 
         // Individual ports and the layout as a whole can be named here. By default, these names
-        // are generated as needed. This layout will be called 'Stereo', while a layout with
-        // only one input and output channel would be called 'Mono'.
+        // are generated as needed. This layout will be called 'Mono', while a layout with
+        // two input and output channels would be called 'Stereo'.
         names: PortNames::const_default(),
     }];
-
 
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
     const MIDI_OUTPUT: MidiConfig = MidiConfig::None;
@@ -169,18 +227,21 @@ impl Plugin for RustNam {
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
-        _buffer_config: &BufferConfig,
+        buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         // Resize buffers and perform other potentially expensive initialization operations here.
         // The `reset()` function is always called right after this function. You can remove this
         // function if you do not need it.
+        self.sample_rate = buffer_config.sample_rate;
         true
     }
 
     fn reset(&mut self) {
         // Reset buffers and envelopes here. This can be called from the audio thread and may not
         // allocate. You can remove this function if you do not need it.
+        self.rms_state = 0.0;
+        self.gain_reduction = 0.0;
     }
 
     fn process(
@@ -191,10 +252,10 @@ impl Plugin for RustNam {
     ) -> ProcessStatus {
         for channel_samples in buffer.iter_samples() {
             // Smoothing is optionally built into the parameters themselves
-            let gain = self.params.gain.smoothed.next();
+            let input_gain = self.params.input_gain.smoothed.next();
 
             for sample in channel_samples {
-                *sample *= gain;
+                *sample *= input_gain;
             }
         }
 
@@ -213,7 +274,7 @@ impl ClapPlugin for RustNam {
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
 
     // Don't forget to change these features
-    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Stereo];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect, ClapFeature::Mono];
 }
 
 impl Vst3Plugin for RustNam {
