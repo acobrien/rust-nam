@@ -8,15 +8,19 @@ const GATE_ENABLED_DEF: bool = true;
 
 const GATE_THRESHOLD_MIN: f32 = -80.0;
 const GATE_THRESHOLD_MAX: f32 = 0.0;
-const GATE_THRESHOLD_DEF: f32 = -60.0;
-
-const GATE_RELEASE_MIN: f32 = 10.0;
-const GATE_RELEASE_MAX: f32 = 500.0;
-const GATE_RELEASE_DEF: f32 = 100.0;
+const GATE_THRESHOLD_DEF: f32 = -40.0;
 
 const GATE_ATTACK_MIN: f32 = 0.1;
 const GATE_ATTACK_MAX: f32 = 50.0;
-const GATE_ATTACK_DEFAULT: f32 = 5.0;
+const GATE_ATTACK_DEF: f32 = 2.0;
+
+const GATE_RELEASE_MIN: f32 = 50.0;
+const GATE_RELEASE_MAX: f32 = 500.0;
+const GATE_RELEASE_DEF: f32 = 200.0;
+
+const GATE_DECAY_MIN: f32 = 1.0;
+const GATE_DECAY_MAX: f32 = 50.0;
+const GATE_DECAY_DEF: f32 = 10.0;
 
 const OUTPUT_GAIN_MIN: f32 = -30.0;
 const OUTPUT_GAIN_MAX: f32 = 30.0;
@@ -27,8 +31,8 @@ use std::sync::{Arc};
 
 struct RustNam {
     params: Arc<RustNamParams>,
-    rms_state: f32, // running RMS estimate
-    gain_reduction: f32, // current gate gain, 0.0 = closed, 1.0 = open
+    rms_sq: f32, // running mean-square estimate
+    gate_openness: f32, // 0.0 to 1.0, closed to open
     sample_rate: f32, // needed to convert ms to per-sample coefficients
 }
 
@@ -51,11 +55,17 @@ struct RustNamParams {
     #[id = "gate_threshold"]
     pub gate_threshold: FloatParam,
 
+    // Time for gate to open ~63% when above threshold
+    #[id = "gate_attack"]
+    pub gate_attack: FloatParam,
+
+    // Time for gate to close ~63% when below threshold
     #[id = "gate_release"]
     pub gate_release: FloatParam,
 
-    #[id = "gate_attack"]
-    pub gate_attack: FloatParam,
+    // Time for ~63% of a step change in signal power to be reflected in RMS
+    #[id = "gate_rms_decay"]
+    pub gate_decay: FloatParam,
 
     #[id = "output_gain"]
     pub output_gain: FloatParam,
@@ -65,8 +75,8 @@ impl Default for RustNam {
     fn default() -> Self {
         Self {
             params: Arc::new(RustNamParams::default()),
-            rms_state: 0.0,
-            gain_reduction: 0.0,
+            rms_sq: 0.0,
+            gate_openness: 0.0,
             sample_rate: 44100.0, // overwritten in initialize()
         }
     }
@@ -123,6 +133,22 @@ impl Default for RustNamParams {
                 .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
                 .with_string_to_value(formatters::s2v_f32_gain_to_db()),
 
+            // *** GATE ATTACK ***
+
+            gate_attack: FloatParam::new(
+                "Gate Attack",
+                GATE_ATTACK_DEF,
+                FloatRange::Skewed {
+                    min: GATE_ATTACK_MIN,
+                    max: GATE_ATTACK_MAX,
+                    factor: FloatRange::skew_factor(0.5)
+                },
+            )
+                .with_smoother(SmoothingStyle::Linear(50.0))
+                .with_unit(" ms")
+                .with_value_to_string(formatters::v2s_f32_rounded(1))
+                .with_string_to_value(Arc::new(|s| s.parse().ok())),
+
             // *** GATE RELEASE ***
 
             gate_release: FloatParam::new(
@@ -131,24 +157,26 @@ impl Default for RustNamParams {
                 FloatRange::Skewed {
                     min: GATE_RELEASE_MIN,
                     max: GATE_RELEASE_MAX,
-                    factor : FloatRange::skew_factor(0.5)
+                    factor: FloatRange::skew_factor(0.5)
                 },
             )
+                .with_smoother(SmoothingStyle::Linear(50.0))
                 .with_unit(" ms")
                 .with_value_to_string(formatters::v2s_f32_rounded(1))
                 .with_string_to_value(Arc::new(|s| s.parse().ok())),
 
-            // *** GATE ATTACK ***
+            // *** GATE DECAY ***
 
-            gate_attack: FloatParam::new(
-                "Gate Attack",
-                GATE_ATTACK_DEFAULT,
+            gate_decay: FloatParam::new(
+                "Gate Decay",
+                GATE_DECAY_DEF,
                 FloatRange::Skewed {
-                    min: GATE_ATTACK_MIN,
-                    max: GATE_ATTACK_MAX,
-                    factor : FloatRange::skew_factor(0.5)
+                    min: GATE_DECAY_MIN,
+                    max: GATE_DECAY_MAX,
+                    factor: FloatRange::skew_factor(0.5)
                 },
             )
+                .with_smoother(SmoothingStyle::Linear(50.0))
                 .with_unit(" ms")
                 .with_value_to_string(formatters::v2s_f32_rounded(1))
                 .with_string_to_value(Arc::new(|s| s.parse().ok())),
@@ -237,11 +265,11 @@ impl Plugin for RustNam {
         true
     }
 
+    // Reset buffers and envelopes here. This can be called from the audio thread and may not
+    // allocate. You can remove this function if you do not need it.
     fn reset(&mut self) {
-        // Reset buffers and envelopes here. This can be called from the audio thread and may not
-        // allocate. You can remove this function if you do not need it.
-        self.rms_state = 0.0;
-        self.gain_reduction = 0.0;
+        self.rms_sq = 0.0;
+        self.gate_openness = 0.0;
     }
 
     fn process(
@@ -250,12 +278,36 @@ impl Plugin for RustNam {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let gate_enabled = self.params.gate_enabled.value();
+
         for channel_samples in buffer.iter_samples() {
-            // Smoothing is optionally built into the parameters themselves
+            // These values must be inside the loop because they progress through the smoothed set
             let input_gain = self.params.input_gain.smoothed.next();
+            let threshold = self.params.gate_threshold.smoothed.next();
+            let output_gain = self.params.output_gain.smoothed.next();
+
+            // The below values may not necessarily require smoothing
+            let rms_pole = (-1.0 / (self.params.gate_decay.smoothed.next() * 0.001 * self.sample_rate)).exp();
+            let attack_pole = (-1.0 / (self.params.gate_attack.smoothed.next() * 0.001 * self.sample_rate)).exp();
+            let release_pole = (-1.0 / (self.params.gate_release.smoothed.next() * 0.001 * self.sample_rate)).exp();
 
             for sample in channel_samples {
-                *sample *= input_gain;
+                *sample *= input_gain; // Apply input gain
+
+                if gate_enabled { // Apply gating
+                    self.rms_sq = rms_pole * self.rms_sq + (1.0 - rms_pole) * (*sample * *sample);
+                    let rms = self.rms_sq.sqrt();
+
+                    let target = if rms >= threshold { 1.0 } else { 0.0 };
+                    let gate_speed = if target > self.gate_openness { attack_pole } else { release_pole };
+                    self.gate_openness = gate_speed * self.gate_openness + (1.0 - gate_speed) * target;
+
+                    *sample *= self.gate_openness;
+                }
+
+                // TODO: Apply dummy NAM transformation
+
+                *sample *= output_gain; // Apply output gain
             }
         }
 
