@@ -27,10 +27,12 @@ const OUTPUT_GAIN_MAX: f32 = 30.0;
 const OUTPUT_GAIN_DEF: f32 = 0.0;
 
 use nih_plug::prelude::*;
-use std::sync::{Arc};
+use nih_plug_egui::{create_egui_editor, egui, EguiState};
+use std::sync::Arc;
 
 struct RustNam {
     params: Arc<RustNamParams>,
+    egui_state: Arc<EguiState>,
     rms_sq: f32, // running mean-square estimate
     gate_openness: f32, // 0.0 to 1.0, closed to open
     sample_rate: f32, // needed to convert ms to per-sample coefficients
@@ -75,11 +77,16 @@ impl Default for RustNam {
     fn default() -> Self {
         Self {
             params: Arc::new(RustNamParams::default()),
+            egui_state: EguiState::from_size(300, 200),
             rms_sq: 0.0,
             gate_openness: 0.0,
             sample_rate: 44100.0, // overwritten in initialize()
         }
     }
+}
+
+struct EditorState {
+    settings_open: bool,
 }
 
 impl Default for RustNamParams {
@@ -200,6 +207,79 @@ impl Default for RustNamParams {
     }
 }
 
+fn drag_slider<P: Param>(ui: &mut egui::Ui, param: &P, setter: &ParamSetter) {
+    let height = 20.0;
+    let handle_width = 14.0;
+    let value_label_width = 65.0;
+
+    ui.horizontal(|ui| {
+        let slider_width = (ui.available_width() - value_label_width - ui.spacing().item_spacing.x).max(50.0);
+        let drag_range = (slider_width - handle_width).max(1.0);
+
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(slider_width, height),
+            egui::Sense::drag(),
+        );
+
+        let normalized = param.unmodulated_normalized_value();
+
+        if response.drag_started() {
+            setter.begin_set_parameter(param);
+        }
+        if response.dragged() {
+            let new_normalized = (normalized + response.drag_delta().x / drag_range).clamp(0.0, 1.0);
+            setter.set_parameter(param, param.preview_plain(new_normalized));
+        }
+        if response.drag_stopped() {
+            setter.end_set_parameter(param);
+        }
+
+        if ui.is_rect_visible(rect) {
+            // Dark rail
+            ui.painter().rect_filled(rect, 3.0, egui::Color32::from_gray(35));
+
+            // Blue fill from left to center of handle
+            let handle_center_x = (rect.left() + normalized * drag_range + handle_width / 2.0).min(rect.right());
+            let fill_rect = egui::Rect::from_min_max(rect.min, egui::pos2(handle_center_x, rect.bottom()));
+            ui.painter().rect_filled(
+                fill_rect,
+                egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 },
+                egui::Color32::from_rgb(50, 110, 190),
+            );
+
+            // Grey handle rect
+            let handle_x = rect.left() + normalized * drag_range;
+            let handle_rect = egui::Rect::from_min_size(
+                egui::pos2(handle_x, rect.top() + 1.0),
+                egui::vec2(handle_width, height - 2.0),
+            );
+            let handle_color = if response.dragged() {
+                egui::Color32::from_gray(210)
+            } else if response.hovered() {
+                egui::Color32::from_gray(175)
+            } else {
+                egui::Color32::from_gray(140)
+            };
+            ui.painter().rect_filled(handle_rect, 2.0, handle_color);
+
+            // Param name centered on rail
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                param.name(),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_gray(220),
+            );
+        }
+
+        let _ = response.on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+
+        // Current value outside the slider
+        let value_str = param.normalized_value_to_string(param.unmodulated_normalized_value(), true);
+        ui.label(value_str);
+    });
+}
+
 impl Plugin for RustNam {
     const NAME: &'static str = "Rust NAM";
     const VENDOR: &'static str = "Aidan O'Brien";
@@ -246,6 +326,47 @@ impl Plugin for RustNam {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        let params = self.params.clone();
+        let egui_state = self.egui_state.clone();
+
+        create_egui_editor(
+            egui_state,
+            EditorState { settings_open: false },
+            |_ctx, _state| {},
+            move |ctx, setter, state| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.heading("Rust NAM");
+                    ui.separator();
+                    drag_slider(ui, &params.input_gain, setter);
+                    drag_slider(ui, &params.output_gain, setter);
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let mut enabled = params.gate_enabled.value();
+                        if ui.checkbox(&mut enabled, "Noise Gate").changed() {
+                            setter.begin_set_parameter(&params.gate_enabled);
+                            setter.set_parameter(&params.gate_enabled, enabled);
+                            setter.end_set_parameter(&params.gate_enabled);
+                        }
+                        if ui.button("Settings").clicked() {
+                            state.settings_open = !state.settings_open;
+                        }
+                    });
+                });
+
+                egui::Window::new("Gate Settings")
+                    .open(&mut state.settings_open)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        drag_slider(ui, &params.gate_threshold, setter);
+                        drag_slider(ui, &params.gate_attack, setter);
+                        drag_slider(ui, &params.gate_release, setter);
+                        drag_slider(ui, &params.gate_decay, setter);
+                    });
+            },
+        )
     }
 
     // This plugin doesn't need any special initialization, but if you need to do anything expensive
